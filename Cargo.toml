@@ -1,0 +1,60 @@
+[package]
+name = "ce-notes"
+version = "0.1.0"
+edition = "2024"
+description = "CE Notes — local-first, end-to-end-encrypted CRDT notes on the CE mesh. An application built ON CE primitives, not part of the node."
+license = "MIT"
+repository = "https://github.com/ce-net/ce-notes"
+keywords = ["ce", "notes", "crdt", "e2e-encryption", "local-first"]
+categories = ["command-line-utilities"]
+
+# ce-notes is both a reusable library (the crypto envelope + CRDT doc model + MergeSet replication
+# substrate) and the `ce-notes` binary (the CLI/TUI front-end). The library is `ce-notes::core`.
+[lib]
+name = "ce_notes"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ce-notes"
+path = "src/bin/ce-notes.rs"
+
+[dependencies]
+# --- CE substrate (by path; these are siblings in the ~/ce-net workspace) ---
+ce-rs = { path = "../ce-rs" }                       # mesh transport + blob/object data layer
+ce-coord = { path = "../ce-coord" }                 # replicated-log engine (Replicated<S>)
+ce-cap = { path = "../ce/crates/ce-cap" }           # capability verifier (sharing/authorization)
+ce-identity = { path = "../ce/crates/ce-identity" } # Ed25519 identity, node key loading
+
+# --- async + error + serde ---
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+hex = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+dirs-next = "2"
+
+# --- text CRDT (Yjs-compatible, behind the NoteDoc trait) ---
+yrs = "0.21"
+
+# --- end-to-end encryption ---
+# XChaCha20-Poly1305 AEAD for the space content key; X25519 sealed-box to wrap the key per device.
+chacha20poly1305 = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+curve25519-dalek = "4"
+ed25519-dalek = "2"
+sha2 = "0.10"
+rand_core = "0.6"
+zeroize = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+# ce-coord depends on ce-rs via git; redirect that to the local path so the whole graph shares ONE
+# `ce-rs` (and therefore one `CeClient` type). Without this, the git and path copies are distinct
+# crates and `Coord::with_client(CeClient)` fails to type-check.
+[patch."https://github.com/ce-net/ce-rs"]
+ce-rs = { path = "../ce-rs" }

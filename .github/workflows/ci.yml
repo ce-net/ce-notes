@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# CE Notes depends on sibling repos by path:
+#   ce-notes -> ../ce-rs           (mesh transport SDK)
+#            -> ../ce-coord        (replicated-log engine; itself git-depends on ce-rs, patched here to ../ce-rs)
+#            -> ../ce/crates/ce-cap        (capability verifier)
+#            -> ../ce/crates/ce-identity   (Ed25519 identity)
+#
+# `actions/checkout` requires every checkout path to live under the workspace, so we check the main
+# repo into `ce-notes/` and the three sibling repos alongside it. Relative path deps (`../ce-rs`,
+# `../ce-coord`, `../ce/...`) then resolve from `ce-notes/`. We run cargo with that as the working
+# directory. ce-cap and ce-identity both live inside the `ce` repo, so one checkout of `ce` covers
+# both path deps.
+jobs:
+  build-test:
+    name: build + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    defaults:
+      run:
+        working-directory: ce-notes
+
+    steps:
+      - name: Checkout ce-notes (this repo)
+        uses: actions/checkout@v4
+        with:
+          path: ce-notes
+
+      - name: Checkout ce-rs (sibling path dep)
+        uses: actions/checkout@v4
+        with:
+          repository: ce-net/ce-rs
+          path: ce-rs
+
+      - name: Checkout ce-coord (sibling path dep)
+        uses: actions/checkout@v4
+        with:
+          repository: ce-net/ce-coord
+          path: ce-coord
+
+      - name: Checkout ce (provides ce-cap and ce-identity)
+        uses: actions/checkout@v4
+        with:
+          repository: ce-net/ce
+          path: ce
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ce-notes
+
+      - name: cargo build
+        run: cargo build --verbose
+
+      - name: cargo test
+        run: cargo test --verbose

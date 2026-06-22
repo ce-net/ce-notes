@@ -234,7 +234,8 @@ mod tests {
     fn at_rest_file_is_not_plaintext() {
         let (dir, store) = tmp_store();
         store.save_meta(&meta()).unwrap();
-        let raw = std::fs::read(dir.path().join("ce-notes/deadbeef/space.json")).unwrap();
+        let raw =
+            std::fs::read(dir.path().join("ce-notes").join("deadbeef").join("space.json")).unwrap();
         // The display name must not appear in the sealed bytes.
         assert!(!raw.windows(4).any(|w| w == b"Work"));
     }

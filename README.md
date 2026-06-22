@@ -118,8 +118,9 @@ tested: the crypto envelope and key wrapping, X25519-from-Ed25519 derivation, th
 Known stubs / follow-ups are marked `// TODO` in the source and listed below:
 
 - **Live two-device sync** requires two running CE nodes; exercised by `scripts/two-device-demo.sh`
-  (needs `ce start` on both ends). The unit tests cover the local logic; the mesh path reuses
-  ce-coord's tested replication.
+  (POSIX shells) or `scripts/two-device-demo.ps1` (PowerShell 7+, including Windows), both needing
+  `ce start` on both ends. The unit tests cover the local logic; the mesh path reuses ce-coord's
+  tested replication.
 - **Key rotation on revoke** (`Space::revoke`) is not yet wired — invite/add and the epoch-bound
   envelope are in place; rotation + re-wrap is the remaining M5 piece.
 - **Snapshot-to-blob checkpointing** (M5, log compaction) is not implemented; per-writer logs grow

@@ -314,9 +314,18 @@ fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+/// The platform default editor, used when `$EDITOR` (and `$VISUAL`) are unset. On Windows there is
+/// no `vi`, so fall back to `notepad`; elsewhere keep the POSIX `vi`.
+#[cfg(windows)]
+const DEFAULT_EDITOR: &str = "notepad";
+#[cfg(not(windows))]
+const DEFAULT_EDITOR: &str = "vi";
+
 /// Open `$EDITOR` on a temp file seeded with `initial`, returning the saved contents.
 fn edit_in_editor(initial: &str) -> Result<String> {
-    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| DEFAULT_EDITOR.to_string());
     let mut path = std::env::temp_dir();
     path.push(format!("ce-notes-edit-{}.md", std::process::id()));
     std::fs::write(&path, initial)?;

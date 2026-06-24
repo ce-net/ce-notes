@@ -49,7 +49,7 @@ pub trait NoteDoc: Send {
 pub mod yrs_impl {
     use super::*;
     use yrs::updates::decoder::Decode;
-    use yrs::{Doc, GetString, ReadTxn, Text, Transact, Update};
+    use yrs::{Doc, GetString, OffsetKind, Options, ReadTxn, Text, Transact, Update};
 
     const BODY: &str = "body";
 
@@ -62,11 +62,20 @@ pub mod yrs_impl {
         fn text_ref(&self) -> yrs::TextRef {
             self.doc.get_or_insert_text(BODY)
         }
+
+        /// Doc options pinned to **UTF-16** offset counting. yrs defaults to UTF-8 *byte* offsets,
+        /// but `set_text`'s diff is computed in UTF-16 units, and UTF-16 is also what JS Yjs uses —
+        /// so this both makes our index math correct AND keeps the wire format interoperable with a
+        /// future CodeMirror+Yjs web client. A fixed `client_id` is NOT used (random per doc is
+        /// required for CRDT correctness), only the offset kind is overridden.
+        fn options() -> Options {
+            Options { offset_kind: OffsetKind::Utf16, ..Options::default() }
+        }
     }
 
     impl NoteDoc for YrsDoc {
         fn new() -> Self {
-            let doc = Doc::new();
+            let doc = Doc::with_options(YrsDoc::options());
             // Materialize the text type so the root exists from the start.
             let _ = doc.get_or_insert_text(BODY);
             YrsDoc { doc }
@@ -107,15 +116,18 @@ pub mod yrs_impl {
             };
 
             let current = self.text();
-            let (prefix, removed_len, inserted) = diff(&current, new_text);
+            // yrs `Text` indexes by UTF-16 code units, so the replacement span MUST be expressed in
+            // UTF-16 units — not Unicode scalars — or any non-BMP character (emoji, astral CJK)
+            // shifts every later offset and corrupts the delta. `diff` returns UTF-16 offsets.
+            let Diff { prefix_u16, removed_u16, inserted } = diff(&current, new_text);
 
             {
                 let mut txn = self.doc.transact_mut();
-                if removed_len > 0 {
-                    text.remove_range(&mut txn, prefix as u32, removed_len as u32);
+                if removed_u16 > 0 {
+                    text.remove_range(&mut txn, prefix_u16, removed_u16);
                 }
                 if !inserted.is_empty() {
-                    text.insert(&mut txn, prefix as u32, &inserted);
+                    text.insert(&mut txn, prefix_u16, &inserted);
                 }
             }
 
@@ -124,11 +136,19 @@ pub mod yrs_impl {
         }
     }
 
-    /// Compute a minimal single-span replacement turning `old` into `new`: a common prefix length, a
-    /// number of chars to remove after it, and the chars to insert. Operates on Unicode scalar
-    /// values (yrs indexes by UTF-16/char units; for the BMP-common note case char indexing matches,
-    /// and the round-trip is exact regardless because the final text equals `new`).
-    fn diff(old: &str, new: &str) -> (usize, usize, String) {
+    /// A minimal single-span replacement turning `old` into `new`, expressed in **UTF-16 code units**
+    /// (yrs's native index space): a common-prefix length, a count of UTF-16 units to remove after
+    /// it, and the substring to insert.
+    pub(crate) struct Diff {
+        pub prefix_u16: u32,
+        pub removed_u16: u32,
+        pub inserted: String,
+    }
+
+    /// Compute the minimal single-span replacement turning `old` into `new`, in UTF-16 units. We
+    /// diff over `char`s (so we never split a code point) but accumulate the UTF-16 length of the
+    /// common prefix / removed middle, because that is the index space yrs `Text` operates in.
+    pub(crate) fn diff(old: &str, new: &str) -> Diff {
         let old_chars: Vec<char> = old.chars().collect();
         let new_chars: Vec<char> = new.chars().collect();
 
@@ -148,9 +168,14 @@ pub mod yrs_impl {
             suffix += 1;
         }
 
-        let removed_len = old_chars.len() - prefix - suffix;
+        // Convert the char-based spans into UTF-16 unit counts (each char is 1 or 2 UTF-16 units).
+        let prefix_u16: u32 = old_chars[..prefix].iter().map(|c| c.len_utf16() as u32).sum();
+        let removed_u16: u32 = old_chars[prefix..old_chars.len() - suffix]
+            .iter()
+            .map(|c| c.len_utf16() as u32)
+            .sum();
         let inserted: String = new_chars[prefix..new_chars.len() - suffix].iter().collect();
-        (prefix, removed_len, inserted)
+        Diff { prefix_u16, removed_u16, inserted }
     }
 }
 
@@ -213,6 +238,43 @@ mod tests {
         // Applying the same update twice changes nothing.
         b.apply_update(&delta).unwrap();
         assert_eq!(b.text(), "idempotent");
+    }
+
+    #[test]
+    fn non_bmp_edit_roundtrips_and_converges() {
+        // Emoji and astral-plane chars are 2 UTF-16 units each. Editing text that contains them and
+        // then merging concurrent edits must converge and round-trip exactly — this catches the
+        // UTF-16-vs-char indexing bug.
+        let mut origin = YrsDoc::new();
+        origin.set_text("hello 😀 world 𝕏 end").unwrap();
+        assert_eq!(origin.text(), "hello 😀 world 𝕏 end");
+        let snap = origin.encode_state();
+
+        let mut a = YrsDoc::from_snapshot(&snap).unwrap();
+        let mut b = YrsDoc::from_snapshot(&snap).unwrap();
+
+        // A edits before the emoji; B edits after the astral char. Both spans cross multi-unit chars.
+        let a_delta = a.set_text("HELLO 😀 world 𝕏 end").unwrap();
+        let b_delta = b.set_text("hello 😀 world 𝕏 END").unwrap();
+
+        a.apply_update(&b_delta).unwrap();
+        b.apply_update(&a_delta).unwrap();
+        assert_eq!(a.text(), b.text(), "non-BMP edits must converge");
+        assert!(a.text().contains("HELLO"));
+        assert!(a.text().contains("END"));
+        assert!(a.text().contains('😀'));
+        assert!(a.text().contains('𝕏'));
+    }
+
+    #[test]
+    fn insert_emoji_into_middle_is_exact() {
+        // Inserting an emoji between existing chars must not shift surrounding text.
+        let mut d = YrsDoc::new();
+        d.set_text("abcdef").unwrap();
+        d.set_text("abc😀def").unwrap();
+        assert_eq!(d.text(), "abc😀def");
+        d.set_text("abc😀d🎉ef").unwrap();
+        assert_eq!(d.text(), "abc😀d🎉ef");
     }
 
     #[test]

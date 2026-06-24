@@ -14,8 +14,98 @@ pub type SpaceId = String;
 pub type NoteId = String;
 /// A folder id — hex random.
 pub type FolderId = String;
+/// A label id — hex random.
+pub type LabelId = String;
 /// A device id — a CE NodeId hex (64 chars).
 pub type DeviceId = String;
+
+/// A note color, mirroring Google Keep's fixed palette. `Default` is the unset/white note.
+///
+/// Parsing is case-insensitive and accepts a few aliases (`grey`, `navy`, `white`/`none`):
+/// ```
+/// use ce_notes::core::model::Color;
+/// assert_eq!(Color::parse("Blue"), Some(Color::Blue));
+/// assert_eq!(Color::parse("grey"), Some(Color::Gray));
+/// assert_eq!(Color::parse("navy"), Some(Color::DarkBlue));
+/// assert_eq!(Color::Red.name(), "red");
+/// assert_eq!(Color::parse("chartreuse"), None);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum Color {
+    #[default]
+    Default,
+    Red,
+    Orange,
+    Yellow,
+    Green,
+    Teal,
+    Blue,
+    DarkBlue,
+    Purple,
+    Pink,
+    Brown,
+    Gray,
+}
+
+impl Color {
+    /// Parse a color name (case-insensitive). Returns `None` for an unknown name.
+    pub fn parse(s: &str) -> Option<Color> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "default" | "white" | "none" => Color::Default,
+            "red" => Color::Red,
+            "orange" => Color::Orange,
+            "yellow" => Color::Yellow,
+            "green" => Color::Green,
+            "teal" => Color::Teal,
+            "blue" => Color::Blue,
+            "darkblue" | "dark-blue" | "navy" => Color::DarkBlue,
+            "purple" => Color::Purple,
+            "pink" => Color::Pink,
+            "brown" => Color::Brown,
+            "gray" | "grey" => Color::Gray,
+            _ => return None,
+        })
+    }
+
+    /// The lowercase canonical name.
+    pub fn name(self) -> &'static str {
+        match self {
+            Color::Default => "default",
+            Color::Red => "red",
+            Color::Orange => "orange",
+            Color::Yellow => "yellow",
+            Color::Green => "green",
+            Color::Teal => "teal",
+            Color::Blue => "blue",
+            Color::DarkBlue => "darkblue",
+            Color::Purple => "purple",
+            Color::Pink => "pink",
+            Color::Brown => "brown",
+            Color::Gray => "gray",
+        }
+    }
+}
+
+/// A user-defined label (Keep-style colored tag). Notes reference labels many-to-many by id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Label {
+    pub label_id: LabelId,
+    pub name: String,
+    #[serde(default)]
+    pub color: Color,
+    #[serde(default)]
+    pub deleted: bool,
+}
+
+/// A time-based reminder attached to a note: a unix-seconds due time and whether it has fired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reminder {
+    /// Unix seconds the reminder is due.
+    pub due_unix: u64,
+    /// Set once the reminder has been surfaced/acknowledged (so it is not re-shown).
+    #[serde(default)]
+    pub done: bool,
+}
 
 /// A member's role within a space. The owner may add/revoke members and rotate the key; writers may
 /// edit; readers may only read.
@@ -100,8 +190,21 @@ impl SpaceMeta {
     }
 }
 
+/// What kind of body a note carries: a freeform markdown text, or a structured checklist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum NoteKind {
+    /// Freeform markdown body (a single `Y.Text`).
+    #[default]
+    Markdown,
+    /// A structured checklist (a CRDT log of [`ChecklistItem`] records in the body doc).
+    Checklist,
+}
+
 /// The cached index entry for a note. The authoritative title also lives as the first heading of the
 /// note body; this is the index copy kept in the per-space index CRDT for fast listing.
+///
+/// Every mutable field is last-writer-wins, reconciled by [`NoteHeader::merge`] using `updated_at`
+/// (ties broken by `note_id`), so the same set of header upserts converges on every replica.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NoteHeader {
     pub note_id: NoteId,
@@ -111,6 +214,88 @@ pub struct NoteHeader {
     /// CRDT-safe delete: a tombstone, never a hard remove (so a concurrent edit + delete keeps the
     /// note recoverable).
     pub deleted: bool,
+    /// Pinned notes sort above all others in the main list.
+    #[serde(default)]
+    pub pinned: bool,
+    /// Archived notes are hidden from the main list (still searchable / restorable).
+    #[serde(default)]
+    pub archived: bool,
+    /// Note color (Keep palette).
+    #[serde(default)]
+    pub color: Color,
+    /// Labels applied to this note (many-to-many, by id).
+    #[serde(default)]
+    pub labels: Vec<LabelId>,
+    /// Body kind: markdown or checklist.
+    #[serde(default)]
+    pub kind: NoteKind,
+    /// Optional time-based reminder.
+    #[serde(default)]
+    pub reminder: Option<Reminder>,
+}
+
+impl NoteHeader {
+    /// A fresh markdown note header.
+    pub fn new(note_id: NoteId, title: String, folder_id: Option<FolderId>, now: u64) -> NoteHeader {
+        NoteHeader {
+            note_id,
+            title,
+            folder_id,
+            updated_at: now,
+            deleted: false,
+            pinned: false,
+            archived: false,
+            color: Color::Default,
+            labels: Vec::new(),
+            kind: NoteKind::Markdown,
+            reminder: None,
+        }
+    }
+
+    /// LWW merge of two header observations for the same note: the newer `updated_at` wins; ties are
+    /// broken deterministically by the serialized form so every replica picks the same survivor.
+    pub fn merge(a: NoteHeader, b: NoteHeader) -> NoteHeader {
+        match a.updated_at.cmp(&b.updated_at) {
+            std::cmp::Ordering::Greater => a,
+            std::cmp::Ordering::Less => b,
+            std::cmp::Ordering::Equal => {
+                // Deterministic tiebreak: pick the lexicographically larger JSON so all replicas
+                // agree even when two edits share a second. (Stable, total, replica-independent.)
+                let ja = serde_json::to_string(&a).unwrap_or_default();
+                let jb = serde_json::to_string(&b).unwrap_or_default();
+                if ja >= jb { a } else { b }
+            }
+        }
+    }
+}
+
+/// One item of a checklist note. Stored as a CRDT log record inside the note's body doc; reconciled
+/// last-writer-wins per `item_id` by `updated_at`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChecklistItem {
+    pub item_id: String,
+    pub text: String,
+    pub checked: bool,
+    /// Sort key (lower first). Lets items be reordered without renumbering siblings.
+    pub order: i64,
+    pub updated_at: u64,
+    #[serde(default)]
+    pub deleted: bool,
+}
+
+impl ChecklistItem {
+    /// LWW merge for the same `item_id`.
+    pub fn merge(a: ChecklistItem, b: ChecklistItem) -> ChecklistItem {
+        match a.updated_at.cmp(&b.updated_at) {
+            std::cmp::Ordering::Greater => a,
+            std::cmp::Ordering::Less => b,
+            std::cmp::Ordering::Equal => {
+                let ja = serde_json::to_string(&a).unwrap_or_default();
+                let jb = serde_json::to_string(&b).unwrap_or_default();
+                if ja >= jb { a } else { b }
+            }
+        }
+    }
 }
 
 /// A folder in the space's folder tree.
@@ -181,14 +366,26 @@ pub struct Invite {
     pub grant_token: String,
 }
 
+/// Maximum accepted size of an encoded [`Invite`] blob (defends `decode` against a hostile/oversized
+/// input being deserialized into memory). An invite carries metadata for every existing member, so
+/// this scales with membership while still bounding the worst case far below any real notebook.
+pub const MAX_INVITE_BYTES: usize = 4 * 1024 * 1024;
+
 impl Invite {
     /// Encode to bytes for transport / file handoff.
     pub fn encode(&self) -> anyhow::Result<Vec<u8>> {
         Ok(serde_json::to_vec(self)?)
     }
 
-    /// Decode an invite blob.
+    /// Decode an invite blob, rejecting anything larger than [`MAX_INVITE_BYTES`] before parsing.
     pub fn decode(bytes: &[u8]) -> anyhow::Result<Invite> {
+        if bytes.len() > MAX_INVITE_BYTES {
+            anyhow::bail!(
+                "invite blob is {} bytes, exceeds the {} byte limit",
+                bytes.len(),
+                MAX_INVITE_BYTES
+            );
+        }
         Ok(serde_json::from_slice(bytes)?)
     }
 }
@@ -255,5 +452,69 @@ mod tests {
         assert!(!meta.can_write("c"));
         assert!(!meta.can_write("b")); // revoked
         assert!(!meta.can_write("unknown"));
+    }
+
+    #[test]
+    fn color_parse_roundtrip() {
+        for c in [
+            Color::Default,
+            Color::Red,
+            Color::DarkBlue,
+            Color::Gray,
+            Color::Teal,
+        ] {
+            assert_eq!(Color::parse(c.name()), Some(c));
+        }
+        assert_eq!(Color::parse("GREY"), Some(Color::Gray));
+        assert_eq!(Color::parse("navy"), Some(Color::DarkBlue));
+        assert_eq!(Color::parse("chartreuse"), None);
+    }
+
+    #[test]
+    fn note_header_merge_is_lww_and_deterministic() {
+        let mut older = NoteHeader::new("n1".into(), "old".into(), None, 100);
+        let mut newer = NoteHeader::new("n1".into(), "new".into(), None, 200);
+        newer.pinned = true;
+        // Newer updated_at wins regardless of argument order.
+        assert_eq!(NoteHeader::merge(older.clone(), newer.clone()).title, "new");
+        assert_eq!(NoteHeader::merge(newer.clone(), older.clone()).title, "new");
+        // Tie: deterministic and order-independent.
+        older.updated_at = 200;
+        let ab = NoteHeader::merge(older.clone(), newer.clone());
+        let ba = NoteHeader::merge(newer, older);
+        assert_eq!(ab, ba, "tiebreak must be order-independent");
+    }
+
+    #[test]
+    fn checklist_item_merge_is_lww() {
+        let a = ChecklistItem {
+            item_id: "i".into(),
+            text: "buy milk".into(),
+            checked: false,
+            order: 0,
+            updated_at: 10,
+            deleted: false,
+        };
+        let mut b = a.clone();
+        b.checked = true;
+        b.updated_at = 20;
+        assert!(ChecklistItem::merge(a.clone(), b.clone()).checked);
+        assert!(ChecklistItem::merge(b, a).checked);
+    }
+
+    #[test]
+    fn invite_decode_rejects_oversize() {
+        let huge = vec![b'x'; MAX_INVITE_BYTES + 1];
+        assert!(Invite::decode(&huge).is_err());
+    }
+
+    #[test]
+    fn note_header_new_defaults() {
+        let h = NoteHeader::new("n".into(), "t".into(), None, 5);
+        assert!(!h.pinned && !h.archived && !h.deleted);
+        assert_eq!(h.color, Color::Default);
+        assert_eq!(h.kind, NoteKind::Markdown);
+        assert!(h.labels.is_empty());
+        assert!(h.reminder.is_none());
     }
 }

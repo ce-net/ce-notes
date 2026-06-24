@@ -14,8 +14,8 @@ pub mod store;
 pub use crypto::{DeviceKeys, SpaceKey, WrappedKey};
 pub use mergelog::{MergeLog, MergeSet};
 pub use model::{
-    AttachmentRef, DeviceId, Folder, FolderId, Invite, MemberEntry, NoteHeader, NoteId, NoteOp,
-    Role, SpaceId, SpaceMeta,
+    AttachmentRef, ChecklistItem, Color, DeviceId, Folder, FolderId, Invite, Label, LabelId,
+    MemberEntry, NoteHeader, NoteId, NoteKind, NoteOp, Reminder, Role, SpaceId, SpaceMeta,
 };
 pub use notedoc::{NoteDoc, YrsDoc};
 pub use notes::{Notes, Space};

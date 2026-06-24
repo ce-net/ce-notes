@@ -15,7 +15,7 @@
 //!   * Invite serialization round-trips (encode == decode).
 
 use ce_notes::core::crypto::{self, DeviceKeys, SpaceKey, WrappedKey, open, seal, unwrap_key, wrap_key};
-use ce_notes::core::model::{Invite, MemberEntry, Role, SpaceMeta};
+use ce_notes::core::model::{ChecklistItem, Color, Invite, MemberEntry, NoteHeader, Role, SpaceMeta};
 use ce_notes::core::notedoc::{NoteDoc, YrsDoc};
 use ce_notes::core::store::Store;
 use proptest::prelude::*;
@@ -90,6 +90,81 @@ proptest! {
         let b = YrsDoc::from_snapshot(&snap).unwrap();
         prop_assert_eq!(b.text(), a.text());
         prop_assert_eq!(b.text(), text);
+    }
+
+    // Arbitrary unicode (including non-BMP emoji / astral chars, 2 UTF-16 units each) must round-trip
+    // exactly through set_text -> read. This is the regression guard for the UTF-16-vs-char indexing
+    // bug: a wrong offset would corrupt or shift the text for any non-BMP input.
+    #[test]
+    fn set_text_roundtrips_arbitrary_unicode(text in "[\\x{0}-\\x{10FFFF}]{0,40}") {
+        let mut d = YrsDoc::new();
+        d.set_text(&text).unwrap();
+        prop_assert_eq!(d.text(), text);
+    }
+
+    // Two replicas making independent edits to text seeded with non-BMP characters must converge.
+    #[test]
+    fn non_bmp_replicas_converge(
+        prefix in "[a-z😀🎉𝕏]{0,8}",
+        a_edit in "[A-Z]{1,4}",
+        b_edit in "[0-9]{1,4}",
+    ) {
+        let mut base = YrsDoc::new();
+        base.set_text(&format!("{prefix}|middle|")).unwrap();
+        let snap = base.encode_state();
+        let mut a = YrsDoc::from_snapshot(&snap).unwrap();
+        let mut b = YrsDoc::from_snapshot(&snap).unwrap();
+        let da = a.set_text(&format!("{prefix}|middle|{a_edit}")).unwrap();
+        let db = b.set_text(&format!("{b_edit}{prefix}|middle|")).unwrap();
+        a.apply_update(&db).unwrap();
+        b.apply_update(&da).unwrap();
+        prop_assert_eq!(a.text(), b.text());
+    }
+}
+
+// ---- LWW merge laws (the index/checklist reduction reducers) ---------------------------------
+
+proptest! {
+    // NoteHeader::merge is commutative and idempotent (a CRDT LWW register): merge(a,b) == merge(b,a)
+    // and merge(a,a) == a, for arbitrary updated_at clocks. This is what makes the index converge
+    // regardless of the order log lines from different devices arrive in.
+    #[test]
+    fn note_header_merge_is_commutative_and_idempotent(t1 in any::<u64>(), t2 in any::<u64>(), p1 in any::<bool>(), p2 in any::<bool>()) {
+        let mut a = NoteHeader::new("id".into(), "A".into(), None, t1);
+        a.pinned = p1;
+        let mut b = NoteHeader::new("id".into(), "B".into(), None, t2);
+        b.pinned = p2;
+        prop_assert_eq!(NoteHeader::merge(a.clone(), b.clone()), NoteHeader::merge(b.clone(), a.clone()));
+        prop_assert_eq!(NoteHeader::merge(a.clone(), a.clone()), a);
+    }
+
+    // NoteHeader::merge is associative: the survivor of three observations does not depend on
+    // grouping. (Total order on (updated_at, json) guarantees this.)
+    #[test]
+    fn note_header_merge_is_associative(t1 in any::<u64>(), t2 in any::<u64>(), t3 in any::<u64>()) {
+        let a = NoteHeader::new("id".into(), "alpha".into(), None, t1);
+        let b = NoteHeader::new("id".into(), "beta".into(), None, t2);
+        let c = NoteHeader::new("id".into(), "gamma".into(), None, t3);
+        let left = NoteHeader::merge(NoteHeader::merge(a.clone(), b.clone()), c.clone());
+        let right = NoteHeader::merge(a, NoteHeader::merge(b, c));
+        prop_assert_eq!(left, right);
+    }
+
+    #[test]
+    fn checklist_item_merge_is_commutative(t1 in any::<u64>(), t2 in any::<u64>(), c1 in any::<bool>(), c2 in any::<bool>()) {
+        let a = ChecklistItem { item_id: "i".into(), text: "x".into(), checked: c1, order: 0, updated_at: t1, deleted: false };
+        let b = ChecklistItem { item_id: "i".into(), text: "y".into(), checked: c2, order: 1, updated_at: t2, deleted: false };
+        prop_assert_eq!(ChecklistItem::merge(a.clone(), b.clone()), ChecklistItem::merge(b, a));
+    }
+
+    #[test]
+    fn color_parse_is_total_over_palette(idx in 0usize..12) {
+        let all = [
+            Color::Default, Color::Red, Color::Orange, Color::Yellow, Color::Green, Color::Teal,
+            Color::Blue, Color::DarkBlue, Color::Purple, Color::Pink, Color::Brown, Color::Gray,
+        ];
+        let c = all[idx];
+        prop_assert_eq!(Color::parse(c.name()), Some(c));
     }
 }
 
@@ -243,6 +318,50 @@ fn shorter_than_nonce_blob_fails_cleanly() {
 }
 
 #[test]
+fn atomic_write_leaves_no_temp_files_and_roundtrips() {
+    // After a successful sealed write the space dir contains exactly the final file (no leftover
+    // .tmp), proving the temp-file+rename path cleans up.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), &[8u8; 32]).unwrap();
+    let meta = SpaceMeta {
+        space_id: "atomic".into(),
+        name: "n".into(),
+        created_at: 0,
+        key_epoch: 0,
+        owner: "o".into(),
+        members: vec![],
+    };
+    store.save_meta(&meta).unwrap();
+    let space_dir = dir.path().join("ce-notes").join("atomic");
+    let names: Vec<String> = std::fs::read_dir(&space_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec!["space.json".to_string()], "only the final file remains: {names:?}");
+    assert_eq!(store.load_meta("atomic").unwrap(), meta);
+}
+
+#[test]
+fn repeated_overwrites_never_corrupt() {
+    // Overwriting the same sealed file many times always leaves a readable, current value (rename is
+    // atomic: a reader sees either the old or the new file, never a torn one).
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), &[9u8; 32]).unwrap();
+    for i in 0..50u64 {
+        let meta = SpaceMeta {
+            space_id: "rw".into(),
+            name: format!("v{i}"),
+            created_at: i,
+            key_epoch: 0,
+            owner: "o".into(),
+            members: vec![],
+        };
+        store.save_meta(&meta).unwrap();
+        assert_eq!(store.load_meta("rw").unwrap().name, format!("v{i}"));
+    }
+}
+
+#[test]
 fn wrong_at_rest_key_cannot_open_anothers_disk() {
     // Two devices with different node secrets derive different at-rest keys; one cannot read the
     // other's sealed store even pointed at the same files.
@@ -313,6 +432,44 @@ fn invite_encode_decode_roundtrips() {
     // The invitee can actually recover the space key from the round-tripped wrap.
     let recovered = unwrap_key(dev.secret(), &back.wrapped_key).unwrap();
     assert_eq!(recovered.0, space_key.0);
+}
+
+#[test]
+fn tampered_invite_wrapped_key_is_rejected() {
+    // An invite whose wrapped_key ciphertext is altered in transit must fail to unwrap (AEAD), so a
+    // man-in-the-middle cannot hand a victim a key they cannot actually recover, nor smuggle a forged
+    // one. This is the crypto core of import_invite's safety.
+    use ce_notes::core::crypto::NONCE_LEN;
+    let dev = DeviceKeys::from_ed25519_secret(&[33u8; 32]);
+    let space_key = SpaceKey::generate();
+    let mut wrapped = wrap_key(&dev.public(), 1, &space_key).unwrap();
+    // Sanity: untampered unwraps.
+    assert!(unwrap_key(dev.secret(), &wrapped).is_ok());
+    // Flip a ciphertext byte.
+    wrapped.ct[0] ^= 0xff;
+    let meta = SpaceMeta {
+        space_id: "sid".into(),
+        name: "Space".into(),
+        created_at: 0,
+        key_epoch: 1,
+        owner: "owner".into(),
+        members: vec![],
+    };
+    let invite = Invite {
+        space_meta: meta,
+        wrapped_key: wrapped,
+        invitee: "inv".into(),
+        invitee_x25519: dev.public(),
+        role: Role::Writer,
+        grant_token: "tok".into(),
+    };
+    let bytes = invite.encode().unwrap();
+    let back = Invite::decode(&bytes).unwrap();
+    assert!(
+        unwrap_key(dev.secret(), &back.wrapped_key).is_err(),
+        "tampered wrapped key must fail to unwrap"
+    );
+    let _ = NONCE_LEN;
 }
 
 #[test]

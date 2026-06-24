@@ -103,6 +103,18 @@ impl MergeSet {
         Ok(())
     }
 
+    /// Stop following a peer's reader-log (e.g. after revocation). Idempotent; drops its drained
+    /// mark too so a future re-add starts clean.
+    pub fn remove_peer(&mut self, peer_id: &str) {
+        self.readers.remove(peer_id);
+        self.drained.remove(peer_id);
+    }
+
+    /// The set of peer device ids currently followed as reader-logs.
+    pub fn followed_peers(&self) -> Vec<String> {
+        self.readers.keys().cloned().collect()
+    }
+
     /// Publish one op from this device. Returns the assigned [`Version`] in this device's writer-log.
     pub async fn publish(&self, op: NoteOp) -> Result<Version> {
         self.writer.propose(op).await
@@ -134,6 +146,30 @@ impl MergeSet {
         out
     }
 
+    /// A snapshot of the per-log drained high-water marks (`log_id -> drained_count`), for
+    /// persistence so a reopen does not re-drain the entire op history.
+    pub fn drained_marks(&self) -> HashMap<String, usize> {
+        self.drained.clone()
+    }
+
+    /// Restore previously-persisted drained marks. Only marks for logs we actually follow (self +
+    /// known readers) are applied; unknown/stale entries are ignored. Each restored mark is clamped
+    /// to the log's current length so a corrupt/over-large saved value can never skip live ops.
+    pub fn restore_drained(&mut self, marks: &HashMap<String, usize>) {
+        for (id, &mark) in marks {
+            let is_self = id == &self.self_id;
+            let len = if is_self {
+                self.writer.read(|log| log.len())
+            } else {
+                match self.readers.get(id) {
+                    Some(r) => r.read(|log| log.len()),
+                    None => continue, // unknown/stale log id — ignore
+                }
+            };
+            self.drained.insert(id.clone(), clamp_mark(mark, len));
+        }
+    }
+
     /// Per-writer applied versions, for a sync-status display: `(device_id, applied_version)`.
     pub fn sync_status(&self) -> Vec<(String, Version)> {
         let mut v = vec![(self.self_id.clone(), self.writer.version())];
@@ -152,6 +188,12 @@ impl MergeSet {
     pub fn reader_watches(&self) -> HashMap<String, tokio::sync::watch::Receiver<Version>> {
         self.readers.iter().map(|(k, r)| (k.clone(), r.version_watch())).collect()
     }
+}
+
+/// Clamp a persisted drained mark to the log's current length, so a corrupt/over-large saved value
+/// can never skip live ops (it would, at worst, re-drain — which is idempotent for CRDT payloads).
+fn clamp_mark(mark: usize, len: usize) -> usize {
+    mark.min(len)
 }
 
 /// A cheap clonable wrapper so the Space can share a [`MergeSet`] across tasks behind a lock.
@@ -185,5 +227,13 @@ mod tests {
         assert!(log.ops_from(5).is_empty());
         assert!(log.ops_from(1).is_empty());
         assert_eq!(log.ops_from(0).len(), 1);
+    }
+
+    #[test]
+    fn clamp_mark_never_exceeds_len() {
+        assert_eq!(clamp_mark(0, 0), 0);
+        assert_eq!(clamp_mark(5, 3), 3); // over-large saved value clamped to current len
+        assert_eq!(clamp_mark(2, 9), 2); // in-range value preserved
+        assert_eq!(clamp_mark(usize::MAX, 7), 7);
     }
 }

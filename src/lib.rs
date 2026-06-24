@@ -30,6 +30,7 @@
 pub mod core;
 
 pub use core::{
-    AttachmentRef, DeviceKeys, Invite, MemberEntry, NoteDoc, NoteHeader, NoteOp, Notes, Role, Space,
-    SpaceKey, SpaceMeta, Store, WrappedKey, YrsDoc,
+    AttachmentRef, ChecklistItem, Color, DeviceKeys, Invite, Label, LabelId, MemberEntry, NoteDoc,
+    NoteHeader, NoteKind, NoteOp, Notes, Reminder, Role, Space, SpaceKey, SpaceMeta, Store,
+    WrappedKey, YrsDoc,
 };

@@ -89,11 +89,11 @@ fn spawn_node(ce: &PathBuf, api_port: u16, p2p_port: u16) -> Node {
         let path = data_dir.join("api.token");
         let mut t = String::new();
         for _ in 0..200 {
-            if let Ok(s) = std::fs::read_to_string(&path) {
-                if !s.trim().is_empty() {
-                    t = s.trim().to_string();
-                    break;
-                }
+            if let Ok(s) = std::fs::read_to_string(&path)
+                && !s.trim().is_empty()
+            {
+                t = s.trim().to_string();
+                break;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -184,6 +184,58 @@ async fn notes_full_lifecycle_over_live_node() {
     assert_eq!(space.notes().await.len(), 2, "two notes after second create");
     assert_eq!(space.folders().await.len(), 1, "one folder");
 
+    // --- Keep-style attributes: pin / archive / color / labels / search ---
+    space.set_pinned(&n2, true).await.expect("pin");
+    space.pump_once().await.expect("pump pin");
+    assert!(space.notes().await[0].note_id == n2, "pinned note sorts first");
+
+    // A label, applied to n1, and filtered.
+    let work_label = space.create_label("work", ce_notes::core::Color::Blue).await.expect("label");
+    space.add_note_label(&n1, &work_label).await.expect("add label");
+    space.pump_once().await.expect("pump label");
+    let labeled = space.notes_with_label(&work_label).await;
+    assert_eq!(labeled.len(), 1, "one note carries the label");
+    assert_eq!(labeled[0].note_id, n1);
+
+    // Color round-trips through the index.
+    space.set_color(&n1, ce_notes::core::Color::Red).await.expect("color");
+    space.pump_once().await.expect("pump color");
+    assert_eq!(space.note_header(&n1).await.unwrap().color, ce_notes::core::Color::Red);
+
+    // Full-text search finds the body and label.
+    let hits = space.search("milk").await.expect("search milk");
+    assert!(hits.iter().any(|h| h.note_id == n1), "search matches body text");
+    let by_label = space.search("work").await.expect("search label");
+    assert!(by_label.iter().any(|h| h.note_id == n1), "search matches label name");
+
+    // Archive hides n2 from the main list but keeps it archived/searchable.
+    space.set_archived(&n2, true).await.expect("archive");
+    space.pump_once().await.expect("pump archive");
+    assert!(!space.notes().await.iter().any(|h| h.note_id == n2), "archived hidden");
+    assert!(space.archived_notes().await.iter().any(|h| h.note_id == n2), "archived listed");
+    space.set_archived(&n2, false).await.expect("unarchive");
+    space.set_pinned(&n2, false).await.expect("unpin");
+    space.pump_once().await.expect("pump unarchive");
+
+    // --- Checklist note end-to-end ---
+    let cl = space
+        .create_note_kind("Groceries", None, ce_notes::core::NoteKind::Checklist)
+        .await
+        .expect("checklist note");
+    let i1 = space.add_checklist_item(&cl, "eggs").await.expect("item1");
+    let i2 = space.add_checklist_item(&cl, "butter").await.expect("item2");
+    space.set_checklist_checked(&cl, &i1, true).await.expect("check");
+    space.pump_once().await.expect("pump checklist");
+    let items = space.checklist(&cl).await.expect("read checklist");
+    assert_eq!(items.len(), 2, "two checklist items");
+    assert!(items.iter().find(|i| i.item_id == i1).unwrap().checked, "i1 checked");
+    space.delete_checklist_item(&cl, &i2).await.expect("rm item");
+    space.pump_once().await.expect("pump rm item");
+    assert_eq!(space.checklist(&cl).await.unwrap().len(), 1, "one item after delete");
+    // Clean up the extra checklist note so the count assertions below still hold.
+    space.delete_note(&cl).await.expect("rm checklist note");
+    space.pump_once().await.expect("pump rm checklist");
+
     // Sync status reports this device's own writer-log advanced.
     let status = space.sync_status().await;
     assert!(status.iter().any(|(_, v)| *v > 0), "writer-log version advanced");
@@ -249,6 +301,42 @@ async fn notes_full_lifecycle_over_live_node() {
         .expect("mint invite for stranger");
     let rejected = notes_b.import_invite(&wrong).await;
     assert!(rejected.is_err(), "B must reject an invite not addressed to it");
+
+    // --- Reader-role enforcement: a Reader device cannot mutate locally ---
+    let id_dir_c = work.join("idC");
+    let data_dir_c = work.join("dataC");
+    std::fs::create_dir_all(&id_dir_c).unwrap();
+    std::fs::create_dir_all(&data_dir_c).unwrap();
+    let c_identity = Identity::load_or_generate(&id_dir_c).expect("C id");
+    let c_node_id = c_identity.node_id_hex();
+    let reader_invite = reopened
+        .invite(&c_node_id, ce_notes::core::Role::Reader, 0)
+        .await
+        .expect("mint reader invite");
+    let coord_c = Coord::with_client(client.clone()).await.expect("coord C");
+    let notes_c = Notes::open(&id_dir_c, &data_dir_c, coord_c, client.clone()).await.expect("open C");
+    let space_c = notes_c.import_invite(&reader_invite).await.expect("C import");
+    assert!(!space_c.can_write().await, "C is a reader");
+    assert!(space_c.create_note("nope", None).await.is_err(), "reader cannot create notes");
+    assert!(space_c.set_note_text(&n1, "hijack").await.is_err(), "reader cannot edit notes");
+    assert!(space_c.revoke(&b_node_id).await.is_err(), "reader cannot revoke");
+
+    // --- Revoke + key rotation: after the owner revokes B, the epoch advances ---
+    let epoch_before = reopened.meta().await.key_epoch;
+    reopened.revoke(&b_node_id).await.expect("revoke B");
+    let meta_after = reopened.meta().await;
+    assert_eq!(meta_after.key_epoch, epoch_before + 1, "key epoch bumped on revoke");
+    assert!(
+        meta_after.members.iter().any(|m| m.device_id == b_node_id && m.revoked),
+        "B is tombstoned revoked"
+    );
+    // The owner can still read its own notes after rotation (re-wrapped to itself).
+    let after_rotation = reopened.note_text(&n1).await.expect("owner reads after rotation");
+    assert!(after_rotation.contains("milk"), "owner retains access post-rotation");
+    // A new edit seals under the new epoch and is readable by the owner.
+    reopened.set_note_text(&n1, "# Shopping\n\n- milk\n- bread\n- cheese\n").await.expect("edit post-rotation");
+    reopened.pump_once().await.expect("pump post-rotation");
+    assert!(reopened.note_text(&n1).await.unwrap().contains("cheese"), "new-epoch edit applied");
 
     // Cleanup the working dirs (the node is cleaned by Node::drop).
     let _ = std::fs::remove_dir_all(&work);

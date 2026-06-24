@@ -32,6 +32,9 @@ const AT_REST_LABEL: &[u8] = b"ce-notes-at-rest-v1";
 /// A device-local store. Holds the data root and the at-rest sealing key.
 pub struct Store {
     root: PathBuf,
+    /// The `data_dir` passed to [`Store::open`] (the parent of `root`), kept explicitly so a fresh
+    /// handle can be re-opened without fragile path arithmetic on `root`.
+    data_dir: PathBuf,
     at_rest_key: SpaceKey,
 }
 
@@ -46,12 +49,17 @@ impl Store {
         h.update(AT_REST_LABEL);
         h.update(node_secret);
         let key: [u8; 32] = h.finalize().into();
-        Ok(Store { root, at_rest_key: SpaceKey::from_bytes(key) })
+        Ok(Store { root, data_dir: data_dir.to_path_buf(), at_rest_key: SpaceKey::from_bytes(key) })
     }
 
     /// The data root (`<data_dir>/ce-notes`).
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The `data_dir` this store was opened with (`root`'s parent).
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
     }
 
     fn space_dir(&self, space_id: &str) -> PathBuf {
@@ -72,12 +80,11 @@ impl Store {
         }
         for entry in std::fs::read_dir(&self.root)? {
             let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if entry.path().join("space.json").exists() {
-                        ids.push(name.to_string());
-                    }
-                }
+            if entry.file_type()?.is_dir()
+                && let Some(name) = entry.file_name().to_str()
+                && entry.path().join("space.json").exists()
+            {
+                ids.push(name.to_string());
             }
         }
         ids.sort();
@@ -159,13 +166,48 @@ impl Store {
     }
 }
 
-/// Sealed-blob file format: `nonce (24 bytes) || ciphertext`.
+/// Sealed-blob file format: `nonce (24 bytes) || ciphertext`. Written atomically: bytes go to a
+/// temp file in the same directory, are fsync'd, then renamed over the target, so a crash or
+/// disk-full mid-write can never truncate or corrupt an existing sealed file (it is all-or-nothing).
 fn write_blob(path: &Path, nonce: &[u8; NONCE_LEN], ct: &[u8]) -> Result<()> {
+    use std::io::Write;
+
     let mut buf = Vec::with_capacity(NONCE_LEN + ct.len());
     buf.extend_from_slice(nonce);
     buf.extend_from_slice(ct);
-    std::fs::write(path, &buf).with_context(|| format!("write {}", path.display()))?;
-    Ok(())
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("blob");
+    // A unique temp name in the SAME directory (rename is only atomic within a filesystem).
+    let tmp = parent.join(format!(".{file_name}.tmp-{}-{}", std::process::id(), unique_suffix()));
+
+    let res = (|| -> Result<()> {
+        let mut f = std::fs::File::create(&tmp)
+            .with_context(|| format!("create temp {}", tmp.display()))?;
+        f.write_all(&buf).with_context(|| format!("write temp {}", tmp.display()))?;
+        f.sync_all().with_context(|| format!("fsync temp {}", tmp.display()))?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+        Ok(())
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp); // best-effort cleanup of the partial temp
+    }
+    res
+}
+
+/// A monotonic-ish unique suffix for temp filenames (avoids two concurrent writers colliding on the
+/// same temp path; the final rename is what serializes them).
+fn unique_suffix() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    (t << 20) ^ n
 }
 
 fn read_blob(path: &Path) -> Result<([u8; NONCE_LEN], Vec<u8>)> {

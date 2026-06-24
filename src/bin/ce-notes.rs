@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use ce_coord::Coord;
-use ce_notes::core::{Notes, Role, Space};
+use ce_notes::core::{Color, NoteKind, Notes, Reminder, Role, Space};
 use ce_rs::CeClient;
 use clap::{Parser, Subcommand};
 
@@ -91,6 +91,83 @@ enum Command {
         space: String,
         note_id: String,
     },
+    /// Pin or unpin a note (pinned notes sort to the top).
+    Pin {
+        #[arg(long)]
+        space: String,
+        note_id: String,
+        /// Unpin instead of pin.
+        #[arg(long)]
+        off: bool,
+    },
+    /// Archive or unarchive a note (archived notes are hidden from the main list).
+    Archive {
+        #[arg(long)]
+        space: String,
+        note_id: String,
+        /// Unarchive instead of archive.
+        #[arg(long)]
+        off: bool,
+    },
+    /// Set a note's color (default|red|orange|yellow|green|teal|blue|darkblue|purple|pink|brown|gray).
+    Color {
+        #[arg(long)]
+        space: String,
+        note_id: String,
+        color: String,
+    },
+    /// Set or clear a note's reminder (unix-seconds due time; `--clear` to remove).
+    Remind {
+        #[arg(long)]
+        space: String,
+        note_id: String,
+        /// Due time in unix seconds.
+        #[arg(long)]
+        at: Option<u64>,
+        /// Clear the reminder.
+        #[arg(long)]
+        clear: bool,
+    },
+    /// List due/upcoming reminders in a space.
+    Reminders {
+        #[arg(long)]
+        space: String,
+    },
+    /// Full-text search note titles, labels, and bodies in a space.
+    Search {
+        #[arg(long)]
+        space: String,
+        query: String,
+    },
+    /// List archived notes.
+    Archived {
+        #[arg(long)]
+        space: String,
+    },
+    /// List trashed notes (tombstoned), restorable with `restore`.
+    Trash {
+        #[arg(long)]
+        space: String,
+    },
+    /// Restore a trashed note back into the main list.
+    Restore {
+        #[arg(long)]
+        space: String,
+        note_id: String,
+    },
+    /// Manage labels.
+    #[command(subcommand)]
+    Label(LabelCmd),
+    /// Manage a checklist note.
+    #[command(subcommand)]
+    Check(CheckCmd),
+    /// Revoke a member and rotate the space key (owner only).
+    Revoke {
+        #[arg(long)]
+        space: String,
+        /// Member NodeId (64 hex chars).
+        member: String,
+    },
     /// Create an invite for another device/person by NodeId.
     Invite {
         #[arg(long)]
@@ -128,6 +205,94 @@ enum SpaceCmd {
     New { name: String },
     /// List spaces with local state.
     Ls,
+}
+
+#[derive(Subcommand)]
+enum LabelCmd {
+    /// Create a label.
+    New {
+        #[arg(long)]
+        space: String,
+        name: String,
+        /// Label color (see `color` command for the palette).
+        #[arg(long, default_value = "default")]
+        color: String,
+    },
+    /// List labels in a space.
+    Ls {
+        #[arg(long)]
+        space: String,
+    },
+    /// Delete a label.
+    Rm {
+        #[arg(long)]
+        space: String,
+        label_id: String,
+    },
+    /// Add a label to a note.
+    Add {
+        #[arg(long)]
+        space: String,
+        note_id: String,
+        label_id: String,
+    },
+    /// Remove a label from a note.
+    Del {
+        #[arg(long)]
+        space: String,
+        note_id: String,
+        label_id: String,
+    },
+    /// List notes carrying a label.
+    Notes {
+        #[arg(long)]
+        space: String,
+        label_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum CheckCmd {
+    /// Create a new checklist note.
+    New {
+        #[arg(long)]
+        space: String,
+        title: String,
+    },
+    /// List a checklist note's items.
+    Ls {
+        #[arg(long)]
+        space: String,
+        note_id: String,
+    },
+    /// Add an item to a checklist note.
+    Add {
+        #[arg(long)]
+        space: String,
+        note_id: String,
+        text: String,
+    },
+    /// Check an item.
+    Check {
+        #[arg(long)]
+        space: String,
+        note_id: String,
+        item_id: String,
+    },
+    /// Uncheck an item.
+    Uncheck {
+        #[arg(long)]
+        space: String,
+        note_id: String,
+        item_id: String,
+    },
+    /// Delete an item.
+    Rm {
+        #[arg(long)]
+        space: String,
+        note_id: String,
+        item_id: String,
+    },
 }
 
 #[tokio::main]
@@ -304,6 +469,165 @@ async fn run(cli: Cli) -> Result<()> {
                 let tag = if dev == notes.node_id() { " (this device)" } else { "" };
                 println!("  {dev} : {v}{tag}");
             }
+        }
+        Command::Pin { space, note_id, off } => {
+            let s = open_space(&open_notes(&cli).await?, space).await?;
+            s.set_pinned(note_id, !*off).await?;
+            println!("{} {note_id}", if *off { "unpinned" } else { "pinned" });
+        }
+        Command::Archive { space, note_id, off } => {
+            let s = open_space(&open_notes(&cli).await?, space).await?;
+            s.set_archived(note_id, !*off).await?;
+            println!("{} {note_id}", if *off { "unarchived" } else { "archived" });
+        }
+        Command::Color { space, note_id, color } => {
+            let s = open_space(&open_notes(&cli).await?, space).await?;
+            let c = Color::parse(color)
+                .ok_or_else(|| anyhow::anyhow!("unknown color '{color}'"))?;
+            s.set_color(note_id, c).await?;
+            println!("colored {note_id} {}", c.name());
+        }
+        Command::Remind { space, note_id, at, clear } => {
+            let s = open_space(&open_notes(&cli).await?, space).await?;
+            let reminder = if *clear {
+                None
+            } else {
+                let due = at.ok_or_else(|| anyhow::anyhow!("pass --at <unix-seconds> or --clear"))?;
+                Some(Reminder { due_unix: due, done: false })
+            };
+            s.set_reminder(note_id, reminder).await?;
+            println!("reminder {} for {note_id}", if *clear { "cleared" } else { "set" });
+        }
+        Command::Reminders { space } => {
+            let s = open_space(&open_notes(&cli).await?, space).await?;
+            let due = s.reminders(now_secs()).await;
+            if due.is_empty() {
+                println!("(no reminders)");
+            }
+            for (id, title, r) in due {
+                println!("{}  {title}  (due {})", id, r.due_unix);
+            }
+        }
+        Command::Search { space, query } => {
+            let s = open_space(&open_notes(&cli).await?, space).await?;
+            let hits = s.search(query).await?;
+            if hits.is_empty() {
+                println!("(no matches)");
+            }
+            for h in hits {
+                println!("{}  {}", h.note_id, h.title);
+            }
+        }
+        Command::Archived { space } => {
+            let s = open_space(&open_notes(&cli).await?, space).await?;
+            for h in s.archived_notes().await {
+                println!("{}  {}", h.note_id, h.title);
+            }
+        }
+        Command::Trash { space } => {
+            let s = open_space(&open_notes(&cli).await?, space).await?;
+            for h in s.trashed_notes().await {
+                println!("{}  {}", h.note_id, h.title);
+            }
+        }
+        Command::Restore { space, note_id } => {
+            let s = open_space(&open_notes(&cli).await?, space).await?;
+            s.restore_note(note_id).await?;
+            println!("restored {note_id}");
+        }
+        Command::Revoke { space, member } => {
+            let s = open_space(&open_notes(&cli).await?, space).await?;
+            s.revoke(member).await?;
+            println!("revoked {member} and rotated the space key");
+        }
+        Command::Label(lc) => run_label(&cli, lc).await?,
+        Command::Check(cc) => run_check(&cli, cc).await?,
+    }
+    Ok(())
+}
+
+async fn run_label(cli: &Cli, lc: &LabelCmd) -> Result<()> {
+    let notes = open_notes(cli).await?;
+    match lc {
+        LabelCmd::New { space, name, color } => {
+            let s = open_space(&notes, space).await?;
+            let c = Color::parse(color).ok_or_else(|| anyhow::anyhow!("unknown color '{color}'"))?;
+            let id = s.create_label(name, c).await?;
+            println!("{id}");
+        }
+        LabelCmd::Ls { space } => {
+            let s = open_space(&notes, space).await?;
+            let labels = s.labels().await;
+            if labels.is_empty() {
+                println!("(no labels)");
+            }
+            for l in labels {
+                println!("{}  {}  ({})", l.label_id, l.name, l.color.name());
+            }
+        }
+        LabelCmd::Rm { space, label_id } => {
+            let s = open_space(&notes, space).await?;
+            s.delete_label(label_id).await?;
+            println!("deleted label {label_id}");
+        }
+        LabelCmd::Add { space, note_id, label_id } => {
+            let s = open_space(&notes, space).await?;
+            s.add_note_label(note_id, label_id).await?;
+            println!("labeled {note_id} with {label_id}");
+        }
+        LabelCmd::Del { space, note_id, label_id } => {
+            let s = open_space(&notes, space).await?;
+            s.remove_note_label(note_id, label_id).await?;
+            println!("unlabeled {note_id}");
+        }
+        LabelCmd::Notes { space, label_id } => {
+            let s = open_space(&notes, space).await?;
+            for h in s.notes_with_label(label_id).await {
+                println!("{}  {}", h.note_id, h.title);
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_check(cli: &Cli, cc: &CheckCmd) -> Result<()> {
+    let notes = open_notes(cli).await?;
+    match cc {
+        CheckCmd::New { space, title } => {
+            let s = open_space(&notes, space).await?;
+            let id = s.create_note_kind(title, None, NoteKind::Checklist).await?;
+            println!("{id}");
+        }
+        CheckCmd::Ls { space, note_id } => {
+            let s = open_space(&notes, space).await?;
+            let items = s.checklist(note_id).await?;
+            if items.is_empty() {
+                println!("(no items)");
+            }
+            for i in items {
+                let mark = if i.checked { "[x]" } else { "[ ]" };
+                println!("{} {mark} {}", i.item_id, i.text);
+            }
+        }
+        CheckCmd::Add { space, note_id, text } => {
+            let s = open_space(&notes, space).await?;
+            let id = s.add_checklist_item(note_id, text).await?;
+            println!("{id}");
+        }
+        CheckCmd::Check { space, note_id, item_id } => {
+            let s = open_space(&notes, space).await?;
+            s.set_checklist_checked(note_id, item_id, true).await?;
+            println!("checked {item_id}");
+        }
+        CheckCmd::Uncheck { space, note_id, item_id } => {
+            let s = open_space(&notes, space).await?;
+            s.set_checklist_checked(note_id, item_id, false).await?;
+            println!("unchecked {item_id}");
+        }
+        CheckCmd::Rm { space, note_id, item_id } => {
+            let s = open_space(&notes, space).await?;
+            s.delete_checklist_item(note_id, item_id).await?;
+            println!("removed {item_id}");
         }
     }
     Ok(())

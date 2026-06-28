@@ -20,10 +20,10 @@ path = "src/bin/ce-notes.rs"
 
 [dependencies]
 # --- CE substrate (by path; these are siblings in the ~/ce-net workspace) ---
-ce-rs = { path = "../ce-rs" }                       # mesh transport + blob/object data layer
-ce-coord = { path = "../ce-coord" }                 # replicated-log engine (Replicated<S>)
-ce-cap = { path = "../ce/crates/ce-cap" }           # capability verifier (sharing/authorization)
-ce-identity = { path = "../ce/crates/ce-identity" } # Ed25519 identity, node key loading
+ce-rs = { git = "https://github.com/ce-net/ce-rs" }                       # mesh transport + blob/object data layer
+ce-coord = { git = "https://github.com/ce-net/ce-coord" }                 # replicated-log engine (Replicated<S>)
+ce-iam-core = { git = "https://github.com/ce-net/ce-iam" }           # capability verifier (sharing/authorization)
+ce-identity = { git = "https://github.com/ce-net/ce" } # Ed25519 identity, node key loading
 
 # --- async + error + serde ---
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
@@ -58,4 +58,4 @@ proptest = "1"
 # `ce-rs` (and therefore one `CeClient` type). Without this, the git and path copies are distinct
 # crates and `Coord::with_client(CeClient)` fails to type-check.
 [patch."https://github.com/ce-net/ce-rs"]
-ce-rs = { path = "../ce-rs" }
+ce-rs = { git = "https://github.com/ce-net/ce-rs" }

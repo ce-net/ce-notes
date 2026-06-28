@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use ce_cap::{Caveats, Resource, SignedCapability, encode_chain};
+use ce_iam_core::{Caveats, Resource, SignedCapability, encode_chain};
 use ce_coord::Coord;
 use ce_identity::Identity;
 use ce_rs::CeClient;
